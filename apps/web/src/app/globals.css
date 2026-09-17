@@ -1,0 +1,83 @@
+@import "tailwindcss";
+
+/* ImpactFlow design tokens -- a "blueprint" palette: muted architectural
+   blue as the single accent, IBM Plex for a precise, drafting-table feel. */
+:root {
+  --background: #f7f8fa;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --border: #dde1e7;
+  --foreground: #1a1f28;
+  --muted: #5b6472;
+
+  --accent: #3b6ea5;
+  --accent-foreground: #ffffff;
+
+  --status-critical: #d0393f;
+  --status-high: #c8791f;
+  --status-medium: #a3841f;
+  --status-low: #3f7d5c;
+  --status-approved: #2f8f56;
+  --status-blocked: #d0393f;
+  --status-pending: #6b7684;
+
+  --font-sans: var(--font-plex-sans);
+  --font-mono: var(--font-plex-mono);
+}
+
+.dark {
+  --background: #0e1116;
+  --surface: #161b22;
+  --surface-raised: #1c222b;
+  --border: #262c36;
+  --foreground: #e6e8eb;
+  --muted: #93a0b3;
+
+  --accent: #5f92c4;
+  --accent-foreground: #0e1116;
+
+  --status-critical: #e5484d;
+  --status-high: #f0a356;
+  --status-medium: #e9c46a;
+  --status-low: #6b9c82;
+  --status-approved: #4c9a6a;
+  --status-blocked: #e5484d;
+  --status-pending: #93a0b3;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-border: var(--border);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-status-critical: var(--status-critical);
+  --color-status-high: var(--status-high);
+  --color-status-medium: var(--status-medium);
+  --color-status-low: var(--status-low);
+  --color-status-approved: var(--status-approved);
+  --color-status-blocked: var(--status-blocked);
+  --color-status-pending: var(--status-pending);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
