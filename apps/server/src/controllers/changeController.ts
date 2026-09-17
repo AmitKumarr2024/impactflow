@@ -5,11 +5,17 @@ import { Types } from "mongoose";
 import { z } from "zod";
 
 import { ChangeRequest } from "../models/ChangeRequest";
+
 import { Approval } from "../models/Approval";
+
 import { Material } from "../models/Material";
+
 import { Drawing } from "../models/Drawing";
+
 import { Task } from "../models/Task";
+
 import { ProjectMember } from "../models/ProjectMember";
+
 import { User } from "../models/User";
 
 import { AppError } from "../utils/AppError";
@@ -51,6 +57,9 @@ type ChangeApprovalSource = {
 /* List Changes                                                               */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * List all changes belonging to a project.
+ */
 export async function listChanges(
   req: AuthedRequest,
   res: Response,
@@ -62,6 +71,9 @@ export async function listChanges(
     })
       .populate("requestedBy", "name email role avatar")
       .populate("approvalRequiredFrom", "name email role avatar")
+      .populate("affectedMaterials", "name category price available")
+      .populate("affectedDrawings", "name revision status")
+      .populate("affectedTasks", "title type status")
       .sort({
         createdAt: -1,
       });
@@ -78,6 +90,13 @@ export async function listChanges(
 /* Project Entity Validation                                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Make sure every linked material, drawing and task
+ * belongs to the same project as the change.
+ *
+ * This prevents a change from accidentally linking
+ * entities belonging to another project.
+ */
 async function assertEntitiesBelongToProject(
   projectId: string,
   ids: {
@@ -138,6 +157,13 @@ async function assertEntitiesBelongToProject(
 /* Approver Validation                                                        */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Validate that the selected approver:
+ *
+ * 1. Exists
+ * 2. Is a member of the project
+ * 3. Is not the requester
+ */
 async function assertApproverBelongsToProject(
   projectId: string,
   approverId: string,
@@ -153,17 +179,12 @@ async function assertApproverBelongsToProject(
     );
   }
 
-  /*
-   * IMPORTANT:
-   *
-   * ProjectMember does not have a `user` property in its TypeScript
-   * interface. It stores the relationship using `userId`.
-   *
-   * Therefore we only query ProjectMember here.
+  /**
+   * ProjectMember stores the user
+   * reference as userId.
    */
   const member = await ProjectMember.findOne({
     projectId,
-
     userId: approverId,
   }).lean();
 
@@ -173,15 +194,15 @@ async function assertApproverBelongsToProject(
     );
   }
 
-  /*
-   * Fetch the actual user separately.
+  /**
+   * Confirm the actual user exists.
    */
   const user = await User.findById(approverId)
     .select("_id name email role avatar")
     .lean();
 
   if (!user) {
-    throw AppError.validation("The selected approver user was not found");
+    throw AppError.validation("The selected approver could not be found");
   }
 
   return {
@@ -214,7 +235,8 @@ const createChangeSchema = z.object({
   attachments: z.array(z.string()).optional(),
 
   /**
-   * Exact user who must approve this change.
+   * Exact user who must approve
+   * this change.
    */
   approvalRequiredFrom: z.string().min(1),
 });
@@ -223,6 +245,13 @@ const createChangeSchema = z.object({
 /* Create Change                                                              */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Create a change request.
+ *
+ * A new change starts as SUBMITTED.
+ *
+ * Approval is created after Impact Analysis.
+ */
 export async function createChange(
   req: AuthedRequest,
   res: Response,
@@ -234,7 +263,7 @@ export async function createChange(
     const requesterId = req.user!.userId;
 
     /* ---------------------------------------------------------------------- */
-    /* Validate project entities                                              */
+    /* Validate linked entities                                               */
     /* ---------------------------------------------------------------------- */
 
     await assertEntitiesBelongToProject(req.params.projectId, {
@@ -251,9 +280,7 @@ export async function createChange(
 
     await assertApproverBelongsToProject(
       req.params.projectId,
-
       body.approvalRequiredFrom,
-
       requesterId,
     );
 
@@ -325,7 +352,10 @@ export async function createChange(
 
     const populatedChange = await ChangeRequest.findById(change._id)
       .populate("requestedBy", "name email role avatar")
-      .populate("approvalRequiredFrom", "name email role avatar");
+      .populate("approvalRequiredFrom", "name email role avatar")
+      .populate("affectedMaterials", "name category price available")
+      .populate("affectedDrawings", "name revision status")
+      .populate("affectedTasks", "title type status");
 
     return res.status(201).json({
       change: populatedChange ?? change,
@@ -339,6 +369,9 @@ export async function createChange(
 /* Get Change                                                                 */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Get one change request.
+ */
 export async function getChange(
   req: AuthedRequest,
   res: Response,
@@ -388,6 +421,10 @@ const updateChangeSchema = z.object({
 /* Update Change                                                              */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Update change details and affected
+ * entity links.
+ */
 export async function updateChange(
   req: AuthedRequest,
   res: Response,
@@ -423,9 +460,7 @@ export async function updateChange(
     if (body.approvalRequiredFrom) {
       await assertApproverBelongsToProject(
         existing.projectId.toString(),
-
         body.approvalRequiredFrom,
-
         existing.requestedBy.toString(),
       );
     }
@@ -434,15 +469,9 @@ export async function updateChange(
     /* Update                                                                  */
     /* ---------------------------------------------------------------------- */
 
-    const change = await ChangeRequest.findByIdAndUpdate(
-      req.params.id,
-
-      body,
-
-      {
-        new: true,
-      },
-    )
+    const change = await ChangeRequest.findByIdAndUpdate(req.params.id, body, {
+      new: true,
+    })
       .populate("requestedBy", "name email role avatar")
       .populate("approvalRequiredFrom", "name email role avatar")
       .populate("affectedMaterials", "name category price available")
@@ -454,14 +483,99 @@ export async function updateChange(
     }
 
     /* ---------------------------------------------------------------------- */
+    /* Sync pending approval if task links changed                            */
+    /* ---------------------------------------------------------------------- */
+
+    const hasTaskUpdate = body.affectedTasks !== undefined;
+
+    const hasApproverUpdate = body.approvalRequiredFrom !== undefined;
+
+    if (hasTaskUpdate || hasApproverUpdate) {
+      const pendingApproval = await Approval.findOne({
+        changeRequestId: change._id,
+
+        status: "PENDING",
+      });
+
+      if (pendingApproval) {
+        if (hasApproverUpdate && body.approvalRequiredFrom) {
+          pendingApproval.requiredFrom =
+            body.approvalRequiredFrom as unknown as Types.ObjectId;
+        }
+
+        if (hasTaskUpdate) {
+          const taskIds = body.affectedTasks ?? [];
+
+          const uniqueTaskIds = [
+            ...new Set(taskIds.map((id) => id.toString())),
+          ];
+
+          pendingApproval.blockedTaskIds =
+            uniqueTaskIds as unknown as Types.ObjectId[];
+
+          /**
+           * Unblock tasks that are no longer
+           * part of this approval.
+           *
+           * They can still remain blocked if
+           * another pending approval blocks them.
+           */
+          const previousTaskIds = pendingApproval.blockedTaskIds.map((id) =>
+            id.toString(),
+          );
+
+          await Task.updateMany(
+            {
+              _id: {
+                $in: previousTaskIds,
+                $nin: uniqueTaskIds,
+              },
+              status: "BLOCKED",
+            },
+            {
+              $set: {
+                status: "TODO",
+              },
+            },
+          );
+
+          if (uniqueTaskIds.length > 0) {
+            await Task.updateMany(
+              {
+                _id: {
+                  $in: uniqueTaskIds,
+                },
+                status: {
+                  $ne: "COMPLETED",
+                },
+              },
+              {
+                $set: {
+                  status: "BLOCKED",
+                },
+              },
+            );
+          }
+        }
+
+        await pendingApproval.save();
+      }
+    }
+
+    /* ---------------------------------------------------------------------- */
     /* Activity                                                               */
     /* ---------------------------------------------------------------------- */
 
-    if (body.affectedMaterials || body.affectedDrawings || body.affectedTasks) {
+    if (
+      body.affectedMaterials ||
+      body.affectedDrawings ||
+      body.affectedTasks ||
+      body.approvalRequiredFrom
+    ) {
       const linkedCount =
-        (body.affectedMaterials?.length || 0) +
-        (body.affectedDrawings?.length || 0) +
-        (body.affectedTasks?.length || 0);
+        (body.affectedMaterials?.length ?? 0) +
+        (body.affectedDrawings?.length ?? 0) +
+        (body.affectedTasks?.length ?? 0);
 
       await recordActivity({
         projectId: existing.projectId,
@@ -499,6 +613,18 @@ export async function updateChange(
 /* Ensure Change Approval                                                     */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Create or reuse the approval associated
+ * with a change.
+ *
+ * IMPORTANT:
+ *
+ * The approval blocks ONLY the tasks explicitly
+ * associated with the change.
+ *
+ * We do NOT blindly use every task discovered
+ * by the Impact Engine.
+ */
 async function ensureChangeApproval(
   change: ChangeApprovalSource | null,
 
@@ -511,40 +637,36 @@ async function ensureChangeApproval(
   }
 
   /* ------------------------------------------------------------------------ */
-  /* Validate designated approver                                            */
+  /* Validate designated approver                                             */
   /* ------------------------------------------------------------------------ */
 
-  /*
-   * Do NOT use:
-   *
-   * .populate("user")
-   *
-   * because ProjectMember has userId, not user.
-   */
-
-  const projectMember = await ProjectMember.findOne({
+  const member = await ProjectMember.findOne({
     projectId: change.projectId,
 
     userId: change.approvalRequiredFrom,
   }).lean();
 
-  if (!projectMember) {
+  if (!member) {
     throw AppError.validation(
       "The designated approver is no longer a member of this project",
     );
   }
-
-  /* ------------------------------------------------------------------------ */
-  /* Load approver user                                                       */
-  /* ------------------------------------------------------------------------ */
 
   const approver = await User.findById(change.approvalRequiredFrom)
     .select("_id name email role avatar")
     .lean();
 
   if (!approver) {
-    throw AppError.validation("The designated approver user was not found");
+    throw AppError.validation("The designated approver could not be found");
   }
+
+  /* ------------------------------------------------------------------------ */
+  /* Normalize task IDs                                                       */
+  /* ------------------------------------------------------------------------ */
+
+  const uniqueTaskIds = [
+    ...new Set(affectedTaskIds.map((id) => id.toString())),
+  ];
 
   /* ------------------------------------------------------------------------ */
   /* Existing Approval                                                        */
@@ -554,21 +676,31 @@ async function ensureChangeApproval(
     changeRequestId: change._id,
   });
 
-  const uniqueTaskIds = [
-    ...new Set(affectedTaskIds.map((id) => id.toString())),
-  ];
-
   /* ------------------------------------------------------------------------ */
   /* Existing pending approval                                               */
   /* ------------------------------------------------------------------------ */
 
   if (approval) {
     if (approval.status === "PENDING") {
+      /**
+       * Keep the approval assigned to
+       * the exact designated user.
+       */
       approval.requiredFrom = change.approvalRequiredFrom;
 
-      approval.blockedTaskIds = uniqueTaskIds as any;
+      /**
+       * IMPORTANT:
+       * Replace the blocked task list with
+       * the tasks explicitly associated with
+       * this change.
+       */
+      approval.blockedTaskIds = uniqueTaskIds as unknown as Types.ObjectId[];
 
       await approval.save();
+
+      /* -------------------------------------------------------------------- */
+      /* Block only explicitly affected tasks                                */
+      /* -------------------------------------------------------------------- */
 
       if (uniqueTaskIds.length > 0) {
         await Task.updateMany(
@@ -581,7 +713,6 @@ async function ensureChangeApproval(
               $ne: "COMPLETED",
             },
           },
-
           {
             $set: {
               status: "BLOCKED",
@@ -605,11 +736,14 @@ async function ensureChangeApproval(
 
     title: `Approval Required — ${change.title}`,
 
-    /*
-     * Exact user who must approve.
+    /**
+     * Exact designated user.
      */
     requiredFrom: change.approvalRequiredFrom,
 
+    /**
+     * ONLY explicitly affected tasks.
+     */
     blockedTaskIds: uniqueTaskIds,
 
     status: "PENDING",
@@ -630,7 +764,6 @@ async function ensureChangeApproval(
           $ne: "COMPLETED",
         },
       },
-
       {
         $set: {
           status: "BLOCKED",
@@ -664,23 +797,19 @@ async function ensureChangeApproval(
   /* Notification                                                             */
   /* ------------------------------------------------------------------------ */
 
-  await notifyMany(
-    [change.approvalRequiredFrom.toString()],
+  await notifyMany([change.approvalRequiredFrom.toString()], {
+    projectId: change.projectId,
 
-    {
-      projectId: change.projectId,
+    title: approval.title,
 
-      title: approval.title,
+    message:
+      `${change.title} requires your approval ` +
+      `before dependent work can proceed.`,
 
-      message:
-        `${change.title} requires your approval ` +
-        `before dependent work can proceed.`,
+    entityType: "Approval",
 
-      entityType: "Approval",
-
-      entityId: approval._id,
-    },
-  );
+    entityId: approval._id,
+  });
 
   /* ------------------------------------------------------------------------ */
   /* Socket                                                                   */
@@ -701,6 +830,21 @@ async function ensureChangeApproval(
 /* Analyze Impact                                                             */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Central Impact Engine action.
+ *
+ * CHANGE
+ *   ↓
+ * IMPACT ENGINE
+ *   ↓
+ * impact analysis
+ *   ↓
+ * explicit change dependencies
+ *   ↓
+ * CREATE / UPDATE APPROVAL
+ *   ↓
+ * PENDING_APPROVAL
+ */
 export async function analyze(
   req: AuthedRequest,
   res: Response,
@@ -714,7 +858,7 @@ export async function analyze(
     const analysis = await impactEngine.analyzeChange(req.params.id);
 
     /* ---------------------------------------------------------------------- */
-    /* Load change                                                            */
+    /* Load Change                                                            */
     /* ---------------------------------------------------------------------- */
 
     const change = await ChangeRequest.findById(req.params.id);
@@ -724,7 +868,7 @@ export async function analyze(
     }
 
     /* ---------------------------------------------------------------------- */
-    /* Build approval source                                                  */
+    /* Build Approval Source                                                  */
     /* ---------------------------------------------------------------------- */
 
     const changeForApproval: ChangeApprovalSource = {
@@ -740,19 +884,43 @@ export async function analyze(
     };
 
     /* ---------------------------------------------------------------------- */
-    /* Create / reuse approval                                                */
+    /* IMPORTANT FIX                                                          */
+    /* ---------------------------------------------------------------------- */
+
+    /**
+     * The Impact Engine can discover downstream
+     * affected tasks.
+     *
+     * However, approval blocking must be based
+     * on the tasks explicitly linked to THIS
+     * Change Request.
+     *
+     * This prevents an unrelated task such as:
+     *
+     * Bathroom Marble Procurement
+     *
+     * from being blocked by:
+     *
+     * Replace Living Room Flooring Material
+     */
+    const approvalTaskIds = Array.isArray(change.affectedTasks)
+      ? change.affectedTasks
+      : [];
+
+    /* ---------------------------------------------------------------------- */
+    /* Create / Reuse Approval                                                */
     /* ---------------------------------------------------------------------- */
 
     const approval = await ensureChangeApproval(
       changeForApproval,
 
-      analysis.affectedTasks || [],
+      approvalTaskIds,
 
       req.user!.role,
     );
 
     /* ---------------------------------------------------------------------- */
-    /* Change status                                                          */
+    /* Change Status                                                          */
     /* ---------------------------------------------------------------------- */
 
     if (approval && approval.status === "PENDING") {
@@ -764,7 +932,7 @@ export async function analyze(
     }
 
     /* ---------------------------------------------------------------------- */
-    /* Stakeholder notification                                               */
+    /* Notify Stakeholders                                                    */
     /* ---------------------------------------------------------------------- */
 
     if (analysis.affectedStakeholders.length) {
@@ -775,7 +943,8 @@ export async function analyze(
 
         message:
           `This change is rated ` +
-          `${analysis.impactLevel} impact and affects ` +
+          `${analysis.impactLevel} impact ` +
+          `and affects ` +
           `${analysis.affectedMaterials.length} material(s), ` +
           `${analysis.affectedTasks.length} task(s), and ` +
           `${analysis.affectedApprovals.length} approval(s).`,
@@ -787,7 +956,7 @@ export async function analyze(
     }
 
     /* ---------------------------------------------------------------------- */
-    /* Socket                                                                  */
+    /* Socket                                                                 */
     /* ---------------------------------------------------------------------- */
 
     getIO()
@@ -804,7 +973,10 @@ export async function analyze(
 
     const populatedChange = await ChangeRequest.findById(change._id)
       .populate("requestedBy", "name email role avatar")
-      .populate("approvalRequiredFrom", "name email role avatar");
+      .populate("approvalRequiredFrom", "name email role avatar")
+      .populate("affectedMaterials", "name category price available")
+      .populate("affectedDrawings", "name revision status")
+      .populate("affectedTasks", "title type status");
 
     return res.json({
       analysis,
@@ -822,6 +994,9 @@ export async function analyze(
 /* Get Impact                                                                 */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Get the stored impact analysis.
+ */
 export async function getImpact(
   req: AuthedRequest,
   res: Response,
@@ -854,6 +1029,12 @@ export async function getImpact(
 /* Legacy Approve                                                             */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Legacy change approval endpoint.
+ *
+ * This endpoint does NOT bypass the
+ * Approval Dependency Map.
+ */
 export async function approve(
   req: AuthedRequest,
   res: Response,
@@ -872,6 +1053,10 @@ export async function approve(
       status: "PENDING",
     });
 
+    /**
+     * Do not allow this endpoint
+     * to bypass the approval workflow.
+     */
     if (pendingApprovals.length > 0) {
       throw AppError.conflict(
         "This change has pending approval(s). Approve it from the Approval Dependency Map.",
@@ -920,6 +1105,12 @@ export async function approve(
 /* Legacy Reject                                                              */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Legacy change rejection endpoint.
+ *
+ * Normal rejection should happen through
+ * the Approval Dependency Map.
+ */
 export async function reject(
   req: AuthedRequest,
   res: Response,
@@ -938,6 +1129,10 @@ export async function reject(
       status: "PENDING",
     });
 
+    /**
+     * Do not allow a random user to bypass
+     * a pending designated approval.
+     */
     if (pendingApprovals.length > 0) {
       throw AppError.conflict(
         "This change has pending approval(s). Reject the approval from the Approval Dependency Map.",
